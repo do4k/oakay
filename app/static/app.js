@@ -234,6 +234,7 @@ function makeItemEl(item) {
   text.spellcheck = true;
   text.addEventListener('keydown', e => handleKeyDown(e, item.id));
   text.addEventListener('input', () => scheduleContentSave(item.id, text.textContent));
+  text.addEventListener('blur', () => flushContentSave(item.id, text.textContent));
   text.addEventListener('paste', e => {
     e.preventDefault();
     document.execCommand('insertText', false, e.clipboardData.getData('text/plain'));
@@ -418,10 +419,11 @@ function scheduleContentSave(id, content) {
 }
 
 function flushContentSave(id, content) {
-  if (saveTimers.has(id)) { clearTimeout(saveTimers.get(id)); saveTimers.delete(id); }
-  const item = getItem(id);
-  if (item && item.content !== content) {
-    item.content = content;
+  if (saveTimers.has(id)) {
+    clearTimeout(saveTimers.get(id));
+    saveTimers.delete(id);
+    const item = getItem(id);
+    if (item) item.content = content;
     api('PUT', `/api/todos/${id}`, { content }).catch(err => showToast(err.message));
   }
 }
