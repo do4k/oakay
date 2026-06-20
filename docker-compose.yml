@@ -1,0 +1,14 @@
+services:
+  oakay:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - oakay-data:/data
+    environment:
+      - DATABASE_URL=/data/oakay.db
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production-please}
+
+volumes:
+  oakay-data:

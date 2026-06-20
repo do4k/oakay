@@ -1,0 +1,458 @@
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Optional, List
+
+import aiosqlite
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
+from fastapi.staticfiles import StaticFiles
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel
+
+DB_PATH = os.getenv("DATABASE_URL", "/data/oakay.db")
+SECRET_KEY = os.getenv("SECRET_KEY", "oakay-dev-secret-change-in-production")
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_DAYS = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+async def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA foreign_keys = ON")
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS lists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT 'My List',
+                position REAL NOT NULL DEFAULT 0.0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                list_id INTEGER,
+                content TEXT NOT NULL DEFAULT '',
+                checked INTEGER NOT NULL DEFAULT 0,
+                parent_id INTEGER,
+                position REAL NOT NULL DEFAULT 0.0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (list_id) REFERENCES lists(id) ON DELETE CASCADE,
+                FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE
+            )
+        """)
+
+        # Migration: add list_id column if it doesn't exist yet
+        async with db.execute("PRAGMA table_info(todos)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        if "list_id" not in cols:
+            await db.execute("ALTER TABLE todos ADD COLUMN list_id INTEGER REFERENCES lists(id) ON DELETE CASCADE")
+
+        # Migration: create default list for users with orphaned todos
+        async with db.execute("SELECT DISTINCT user_id FROM todos WHERE list_id IS NULL") as cur:
+            orphan_users = [row["user_id"] for row in await cur.fetchall()]
+
+        for uid in orphan_users:
+            cur2 = await db.execute(
+                "INSERT INTO lists (user_id, title, position) VALUES (?, 'My List', 0.0)", (uid,)
+            )
+            list_id = cur2.lastrowid
+            await db.execute(
+                "UPDATE todos SET list_id = ? WHERE user_id = ? AND list_id IS NULL", (list_id, uid)
+            )
+
+        await db.commit()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
+
+
+def create_token(user_id: int) -> str:
+    expire = datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS)
+    return jwt.encode({"sub": str(user_id), "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(token: Optional[str] = Cookie(default=None)):
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = int(payload["sub"])
+    except (JWTError, KeyError, ValueError):
+        raise HTTPException(401, "Invalid token")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, username FROM users WHERE id = ?", (user_id,)) as cur:
+            user = await cur.fetchone()
+
+    if not user:
+        raise HTTPException(401, "User not found")
+    return {"id": user["id"], "username": user["username"]}
+
+
+# --- Models ---
+
+class RegisterReq(BaseModel):
+    username: str
+    password: str
+
+class LoginReq(BaseModel):
+    username: str
+    password: str
+
+class CreateListReq(BaseModel):
+    title: str = "New List"
+
+class UpdateListReq(BaseModel):
+    title: Optional[str] = None
+
+class CreateTodoReq(BaseModel):
+    content: str = ""
+    list_id: int
+    parent_id: Optional[int] = None
+    after_id: Optional[int] = None
+
+class UpdateTodoReq(BaseModel):
+    content: Optional[str] = None
+    checked: Optional[bool] = None
+
+class MoveTodoReq(BaseModel):
+    parent_id: Optional[int] = None
+    position: float
+
+class BulkPositionItem(BaseModel):
+    id: int
+    position: float
+
+
+# --- Auth ---
+
+@app.post("/api/auth/register")
+async def register(req: RegisterReq, response: Response):
+    username = req.username.strip()
+    if len(username) < 3:
+        raise HTTPException(400, "Username must be at least 3 characters")
+    if len(req.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    pw_hash = pwd_context.hash(req.password)
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            cur = await db.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, pw_hash)
+            )
+            await db.commit()
+            user_id = cur.lastrowid
+        except aiosqlite.IntegrityError:
+            raise HTTPException(400, "Username already taken")
+
+    token = create_token(user_id)
+    response.set_cookie("token", token, httponly=True, max_age=TOKEN_EXPIRE_DAYS * 86400, samesite="lax")
+    return {"id": user_id, "username": username}
+
+
+@app.post("/api/auth/login")
+async def login(req: LoginReq, response: Response):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, username, password_hash FROM users WHERE username = ?", (req.username,)
+        ) as cur:
+            user = await cur.fetchone()
+
+    if not user or not pwd_context.verify(req.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid username or password")
+
+    token = create_token(user["id"])
+    response.set_cookie("token", token, httponly=True, max_age=TOKEN_EXPIRE_DAYS * 86400, samesite="lax")
+    return {"id": user["id"], "username": user["username"]}
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie("token")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+async def me(user=Depends(get_current_user)):
+    return user
+
+
+# --- Lists ---
+
+@app.get("/api/lists")
+async def get_lists(user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, title, position FROM lists WHERE user_id = ? ORDER BY position, id",
+            (user["id"],)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+@app.post("/api/lists")
+async def create_list(req: CreateListReq, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT MAX(position) as mp FROM lists WHERE user_id = ?", (user["id"],)
+        ) as cur:
+            row = await cur.fetchone()
+        position = (row["mp"] or 0.0) + 100.0
+        cur = await db.execute(
+            "INSERT INTO lists (user_id, title, position) VALUES (?, ?, ?)",
+            (user["id"], req.title.strip() or "New List", position)
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT id, title, position FROM lists WHERE id = ?", (cur.lastrowid,)
+        ) as c:
+            return dict(await c.fetchone())
+
+
+@app.put("/api/lists/{list_id}")
+async def update_list(list_id: int, req: UpdateListReq, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id FROM lists WHERE id = ? AND user_id = ?", (list_id, user["id"])
+        ) as cur:
+            if not await cur.fetchone():
+                raise HTTPException(404, "List not found")
+        if req.title is not None:
+            await db.execute(
+                "UPDATE lists SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (req.title.strip() or "Untitled", list_id)
+            )
+        await db.commit()
+        async with db.execute(
+            "SELECT id, title, position FROM lists WHERE id = ?", (list_id,)
+        ) as cur:
+            return dict(await cur.fetchone())
+
+
+@app.delete("/api/lists/{list_id}")
+async def delete_list(list_id: int, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM lists WHERE id = ? AND user_id = ?", (list_id, user["id"])
+        ) as cur:
+            if not await cur.fetchone():
+                raise HTTPException(404, "List not found")
+        # Delete all root todos (cascades to children via recursive delete)
+        async with db.execute(
+            "SELECT id FROM todos WHERE list_id = ? AND parent_id IS NULL", (list_id,)
+        ) as cur:
+            root_ids = [row[0] for row in await cur.fetchall()]
+        for tid in root_ids:
+            await _delete_recursive(db, tid)
+        # Delete any orphaned todos in this list
+        await db.execute("DELETE FROM todos WHERE list_id = ?", (list_id,))
+        await db.execute("DELETE FROM lists WHERE id = ?", (list_id,))
+        await db.commit()
+    return {"ok": True}
+
+
+# --- Todos ---
+
+async def _delete_recursive(db, todo_id: int):
+    async with db.execute("SELECT id FROM todos WHERE parent_id = ?", (todo_id,)) as cur:
+        children = [row[0] for row in await cur.fetchall()]
+    for child in children:
+        await _delete_recursive(db, child)
+    await db.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+
+
+async def _compute_position(db, user_id: int, list_id: int, parent_id: Optional[int], after_id: Optional[int]) -> float:
+    db.row_factory = aiosqlite.Row
+
+    if after_id is not None:
+        async with db.execute(
+            "SELECT position FROM todos WHERE id = ? AND user_id = ?", (after_id, user_id)
+        ) as cur:
+            after_row = await cur.fetchone()
+        if not after_row:
+            return 100.0
+        after_pos = after_row["position"]
+
+        if parent_id is not None:
+            async with db.execute(
+                "SELECT position FROM todos WHERE list_id = ? AND parent_id = ? AND position > ? ORDER BY position LIMIT 1",
+                (list_id, parent_id, after_pos)
+            ) as cur:
+                next_row = await cur.fetchone()
+        else:
+            async with db.execute(
+                "SELECT position FROM todos WHERE list_id = ? AND parent_id IS NULL AND position > ? ORDER BY position LIMIT 1",
+                (list_id, after_pos)
+            ) as cur:
+                next_row = await cur.fetchone()
+
+        if next_row:
+            return (after_pos + next_row["position"]) / 2
+        return after_pos + 100.0
+    else:
+        if parent_id is not None:
+            async with db.execute(
+                "SELECT MAX(position) as mp FROM todos WHERE list_id = ? AND parent_id = ?",
+                (list_id, parent_id)
+            ) as cur:
+                row = await cur.fetchone()
+        else:
+            async with db.execute(
+                "SELECT MAX(position) as mp FROM todos WHERE list_id = ? AND parent_id IS NULL",
+                (list_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        mp = row["mp"] if row and row["mp"] is not None else 0.0
+        return mp + 100.0
+
+
+@app.get("/api/todos")
+async def list_todos(list_id: int, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id FROM lists WHERE id = ? AND user_id = ?", (list_id, user["id"])
+        ) as cur:
+            if not await cur.fetchone():
+                raise HTTPException(404, "List not found")
+        async with db.execute(
+            "SELECT id, content, checked, parent_id, position FROM todos WHERE list_id = ? ORDER BY position",
+            (list_id,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+@app.post("/api/todos")
+async def create_todo(req: CreateTodoReq, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id FROM lists WHERE id = ? AND user_id = ?", (req.list_id, user["id"])
+        ) as cur:
+            if not await cur.fetchone():
+                raise HTTPException(404, "List not found")
+
+        position = await _compute_position(db, user["id"], req.list_id, req.parent_id, req.after_id)
+        cur = await db.execute(
+            "INSERT INTO todos (user_id, list_id, content, parent_id, position) VALUES (?, ?, ?, ?, ?)",
+            (user["id"], req.list_id, req.content, req.parent_id, position)
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT id, content, checked, parent_id, position FROM todos WHERE id = ?", (cur.lastrowid,)
+        ) as c:
+            return dict(await c.fetchone())
+
+
+@app.put("/api/todos/{todo_id}")
+async def update_todo(todo_id: int, req: UpdateTodoReq, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id FROM todos WHERE id = ? AND user_id = ?", (todo_id, user["id"])
+        ) as cur:
+            if not await cur.fetchone():
+                raise HTTPException(404, "Todo not found")
+
+        sets = ["updated_at = CURRENT_TIMESTAMP"]
+        vals = []
+        if req.content is not None:
+            sets.append("content = ?")
+            vals.append(req.content)
+        if req.checked is not None:
+            sets.append("checked = ?")
+            vals.append(1 if req.checked else 0)
+
+        vals.append(todo_id)
+        await db.execute(f"UPDATE todos SET {', '.join(sets)} WHERE id = ?", vals)
+        await db.commit()
+        async with db.execute(
+            "SELECT id, content, checked, parent_id, position FROM todos WHERE id = ?", (todo_id,)
+        ) as cur:
+            return dict(await cur.fetchone())
+
+
+@app.put("/api/todos/{todo_id}/move")
+async def move_todo(todo_id: int, req: MoveTodoReq, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id FROM todos WHERE id = ? AND user_id = ?", (todo_id, user["id"])
+        ) as cur:
+            if not await cur.fetchone():
+                raise HTTPException(404, "Todo not found")
+
+        if req.parent_id is None:
+            await db.execute(
+                "UPDATE todos SET parent_id = NULL, position = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (req.position, todo_id)
+            )
+        else:
+            await db.execute(
+                "UPDATE todos SET parent_id = ?, position = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (req.parent_id, req.position, todo_id)
+            )
+        await db.commit()
+        async with db.execute(
+            "SELECT id, content, checked, parent_id, position FROM todos WHERE id = ?", (todo_id,)
+        ) as cur:
+            return dict(await cur.fetchone())
+
+
+@app.delete("/api/todos/{todo_id}")
+async def delete_todo(todo_id: int, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM todos WHERE id = ? AND user_id = ?", (todo_id, user["id"])
+        ) as cur:
+            if not await cur.fetchone():
+                raise HTTPException(404, "Todo not found")
+        await _delete_recursive(db, todo_id)
+        await db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/todos/bulk-positions")
+async def bulk_positions(items: List[BulkPositionItem], user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        for item in items:
+            await db.execute(
+                "UPDATE todos SET position = ? WHERE id = ? AND user_id = ?",
+                (item.position, item.id, user["id"])
+            )
+        await db.commit()
+    return {"ok": True}
+
+
+app.mount("/", StaticFiles(directory="static", html=True), name="static")

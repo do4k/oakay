@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oakay!</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <!-- Auth -->
+  <div id="auth-section">
+    <div class="auth-wrap">
+      <div class="brand-logo">
+        <span class="brand-oak">Oak</span><span class="brand-ay">ay!</span>
+      </div>
+      <p class="brand-tagline">Your todo list, deeper than ever.</p>
+
+      <div id="login-panel" class="auth-card">
+        <h2>Welcome back</h2>
+        <form id="login-form">
+          <input type="text" id="login-username" placeholder="Username" autocomplete="username" required>
+          <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
+          <button type="submit">Sign in</button>
+        </form>
+        <p class="auth-switch">No account? <a href="#" id="show-register">Create one</a></p>
+      </div>
+
+      <div id="register-panel" class="auth-card" style="display:none">
+        <h2>Create account</h2>
+        <form id="register-form">
+          <input type="text" id="reg-username" placeholder="Username (min 3 chars)" autocomplete="username" required>
+          <input type="password" id="reg-password" placeholder="Password (min 6 chars)" autocomplete="new-password" required>
+          <button type="submit">Create account</button>
+        </form>
+        <p class="auth-switch">Have an account? <a href="#" id="show-login">Sign in</a></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- App -->
+  <div id="app-section" style="display:none">
+    <header class="app-header">
+      <div class="header-left">
+        <button id="sidebar-toggle" class="btn-icon" title="Toggle sidebar" aria-label="Toggle sidebar">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+        <div class="brand-logo small">
+          <span class="brand-oak">Oak</span><span class="brand-ay">ay!</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <span id="username-display" class="header-user"></span>
+        <button id="logout-btn" class="btn-ghost">Sign out</button>
+      </div>
+    </header>
+
+    <div class="app-body">
+      <!-- Sidebar -->
+      <aside id="sidebar" class="sidebar">
+        <button id="new-list-btn" class="new-list-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          New list
+        </button>
+        <nav id="list-nav" class="list-nav"></nav>
+      </aside>
+
+      <!-- Main content -->
+      <main class="app-main">
+        <div class="note-card" id="note-card">
+          <div class="note-header">
+            <div class="note-title" contenteditable="true" id="note-title" data-placeholder="List title"></div>
+          </div>
+          <div id="todo-list" class="todo-list"></div>
+          <button id="add-item-btn" class="add-item-btn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add item
+          </button>
+        </div>
+
+        <div class="hints">
+          <span><kbd>Enter</kbd> new item</span>
+          <span><kbd>Tab</kbd> indent</span>
+          <span><kbd>⇧Tab</kbd> outdent</span>
+          <span><kbd>↑↓</kbd> navigate</span>
+          <span><kbd>Bksp</kbd> on empty deletes</span>
+          <span>drag grip to reorder</span>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast" role="alert" aria-live="assertive"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
