@@ -217,11 +217,13 @@ body {
   position: relative;
   padding: 1px 8px 1px 12px;
   transition: background 0.1s;
+  touch-action: pan-y; /* allow vertical scroll; horizontal captured for drag */
 }
 .todo-item:hover { background: #FAFAF8; }
 .todo-item:hover .grip { opacity: 1; }
 .todo-item:hover .delete-btn { opacity: 1; }
 .todo-item.dragging { opacity: 0.35; }
+.todo-item.drag-over { background: var(--primary-light); }
 
 /* Depth indentation */
 .todo-item[data-depth="0"] { padding-left: 12px; }
@@ -392,6 +394,36 @@ body {
 }
 .no-lists-hint strong { display: block; margin-bottom: 6px; font-size: 1rem; }
 
+/* ── Drag ghost ── */
+.drag-ghost {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9999;
+  background: var(--card);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.18);
+  border-left: 3px solid var(--primary);
+  padding: 8px 16px;
+  font-size: 0.925rem;
+  color: var(--text);
+  max-width: 380px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transform: rotate(-1.5deg);
+  opacity: 0.9;
+}
+
+/* ── Sidebar backdrop (mobile tap-away) ── */
+.sidebar-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 19;
+  background: rgba(0,0,0,0.35);
+}
+.sidebar-backdrop.visible { display: block; }
+
 /* ── Responsive ── */
 @media (max-width: 600px) {
   :root { --sidebar-w: 200px; }
@@ -399,4 +431,12 @@ body {
   .sidebar.hidden { margin-left: calc(-1 * var(--sidebar-w)); }
   .app-main { padding: 16px 12px 60px; }
   .hints { display: none; }
+  /* grip always subtly visible on touch devices */
+  .grip { opacity: 0.25; }
+  .todo-item:hover .grip { opacity: 0.25; }
+}
+
+/* On desktop, backdrop never shows regardless of class */
+@media (min-width: 601px) {
+  .sidebar-backdrop { display: none !important; }
 }

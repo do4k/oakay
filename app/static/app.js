@@ -147,24 +147,76 @@ function makeItemEl(item) {
   div.dataset.id = item.id;
   div.setAttribute('data-depth', item.depth);
 
-  // Grip
+  // Grip (visual affordance only — drag is handled by pointerdown below)
   const grip = document.createElement('div');
   grip.className = 'grip';
   grip.innerHTML = gripSvg();
   grip.title = 'Drag to reorder or indent';
-  grip.draggable = true;
-  grip.addEventListener('dragstart', e => {
-    dragItemId = item.id;
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', String(item.id));
-    e.dataTransfer.setDragImage(div, 24, 18);
-    setTimeout(() => div.classList.add('dragging'), 0);
-  });
-  grip.addEventListener('dragend', () => {
-    div.classList.remove('dragging');
-    dragItemId = null;
-    dropTarget = null;
-    hideDropLine();
+
+  // ── Pointer-based drag (works on touch + desktop, drags from anywhere on item) ──
+  div.addEventListener('pointerdown', e => {
+    // Only primary button / touch
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    // Skip interactive children
+    if (e.target.closest('.cb') || e.target.closest('.delete-btn')) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const THRESHOLD = e.pointerType === 'touch' ? 12 : 8;
+    let dragging = false;
+    let ghost = null;
+    const itemRect = div.getBoundingClientRect();
+    const offsetX = e.clientX - itemRect.left;
+    const offsetY = e.clientY - itemRect.top;
+
+    const onMove = ev => {
+      if (!dragging) {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < THRESHOLD) return;
+        // Threshold crossed → start drag
+        ev.preventDefault();
+        dragging = true;
+        dragItemId = item.id;
+        div.setPointerCapture(ev.pointerId);
+        div.classList.add('dragging');
+        document.getElementById('todo-list')?.classList.add('drag-active');
+
+        ghost = document.createElement('div');
+        ghost.className = 'drag-ghost';
+        ghost.textContent = getItem(item.id)?.content || '…';
+        document.body.appendChild(ghost);
+      }
+
+      if (ghost) {
+        ghost.style.left = (ev.clientX - offsetX) + 'px';
+        ghost.style.top  = (ev.clientY - offsetY) + 'px';
+      }
+
+      const list = document.getElementById('todo-list');
+      if (list) {
+        dropTarget = calcDropTarget(ev.clientX, ev.clientY, list);
+        if (dropTarget) showDropLine(dropTarget, list);
+      }
+    };
+
+    const onUp = () => {
+      div.removeEventListener('pointermove', onMove);
+      div.removeEventListener('pointerup', onUp);
+      div.removeEventListener('pointercancel', onUp);
+
+      if (dragging) {
+        if (dropTarget && dragItemId) executeDrop(dragItemId, dropTarget);
+        div.classList.remove('dragging');
+        document.getElementById('todo-list')?.classList.remove('drag-active');
+        ghost?.remove();
+        hideDropLine();
+        dragItemId = null;
+        dropTarget = null;
+      }
+    };
+
+    div.addEventListener('pointermove', onMove, { passive: false });
+    div.addEventListener('pointerup', onUp);
+    div.addEventListener('pointercancel', onUp);
   });
 
   // Checkbox
@@ -223,36 +275,16 @@ function initDragDrop() {
   dragDropReady = true;
 
   const list = document.getElementById('todo-list');
-
   const dropLine = document.createElement('div');
   dropLine.id = 'drop-line';
   dropLine.className = 'drop-line';
   list.appendChild(dropLine);
-
-  list.addEventListener('dragover', e => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    if (!dragItemId) return;
-    dropTarget = calcDropTarget(e, list);
-    if (dropTarget) showDropLine(dropTarget, list);
-  });
-
-  list.addEventListener('dragleave', e => {
-    if (!list.contains(e.relatedTarget)) { hideDropLine(); dropTarget = null; }
-  });
-
-  list.addEventListener('drop', e => {
-    e.preventDefault();
-    if (dropTarget && dragItemId) executeDrop(dragItemId, dropTarget);
-    hideDropLine();
-    dropTarget = null;
-  });
 }
 
-function calcDropTarget(e, list) {
+function calcDropTarget(clientX, clientY, list) {
   const listRect = list.getBoundingClientRect();
-  const cursorY = e.clientY;
-  const cursorX = e.clientX - listRect.left;
+  const cursorY = clientY;
+  const cursorX = clientX - listRect.left;
 
   const excludeIds = new Set([dragItemId, ...getDescendantIds(dragItemId)]);
   const flat = getFlatItems().filter(i => !excludeIds.has(i.id));
@@ -685,8 +717,38 @@ function showToast(msg) {
 function initSidebarToggle() {
   const btn = document.getElementById('sidebar-toggle');
   const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('sidebar-backdrop');
   if (!btn || !sidebar) return;
-  btn.addEventListener('click', () => sidebar.classList.toggle('hidden'));
+
+  const isMobile = () => window.innerWidth <= 600;
+
+  function openSidebar() {
+    sidebar.classList.remove('hidden');
+    if (isMobile() && backdrop) backdrop.classList.add('visible');
+  }
+
+  function closeSidebar() {
+    sidebar.classList.add('hidden');
+    if (backdrop) backdrop.classList.remove('visible');
+  }
+
+  // Start hidden on mobile
+  if (isMobile()) sidebar.classList.add('hidden');
+
+  btn.addEventListener('click', () => {
+    if (sidebar.classList.contains('hidden')) openSidebar();
+    else closeSidebar();
+  });
+
+  if (backdrop) backdrop.addEventListener('click', closeSidebar);
+
+  // Close on resize to desktop (avoids stuck-hidden state)
+  window.addEventListener('resize', () => {
+    if (!isMobile()) {
+      sidebar.classList.remove('hidden');
+      backdrop?.classList.remove('visible');
+    }
+  });
 }
 
 // ── Note title sync (renames current list) ─────────────────────────────────
