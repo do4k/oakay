@@ -13,6 +13,14 @@ let dragItemId = null;
 let dropTarget = null;
 const INDENT = 28;
 
+// WebSocket / presence state
+let ws = null;
+let myConnId = null;
+let myColor = null;
+// Map: connId → {userId, username, color, todoId, selection:{start,end}|null}
+const peers = new Map();
+let selectionSendTimer = null;
+
 // ── API ────────────────────────────────────────────────────────────────────
 async function api(method, path, body) {
   const opts = { method, credentials: 'same-origin' };
@@ -135,6 +143,8 @@ function render() {
     pendingFocus = null;
     requestAnimationFrame(() => focusItem(id, atEnd));
   }
+
+  renderPeerPresence();
 }
 
 function makeItemEl(item) {
@@ -215,6 +225,15 @@ function makeItemEl(item) {
   cb.innerHTML = item.checked ? checkSvg() : '';
   cb.addEventListener('click', () => toggleCheck(item.id));
 
+  // item-wrapper holds the text + selection mirror overlay
+  const wrapper = document.createElement('div');
+  wrapper.className = 'item-wrapper';
+
+  const selMirrors = document.createElement('div');
+  selMirrors.className = 'sel-mirrors';
+  selMirrors.setAttribute('aria-hidden', 'true');
+  wrapper.appendChild(selMirrors);
+
   const text = document.createElement('div');
   text.className = 'item-text';
   text.contentEditable = 'true';
@@ -222,12 +241,26 @@ function makeItemEl(item) {
   text.dataset.placeholder = 'List item';
   text.spellcheck = true;
   text.addEventListener('keydown', e => handleKeyDown(e, item.id));
-  text.addEventListener('input', () => scheduleContentSave(item.id, text.textContent));
-  text.addEventListener('blur', () => flushContentSave(item.id, text.textContent));
+  text.addEventListener('input', () => {
+    scheduleContentSave(item.id, text.textContent);
+    scheduleSelectionSend(item.id, text);
+  });
+  text.addEventListener('focus', () => {
+    scheduleSelectionSend(item.id, text);
+  });
+  text.addEventListener('blur', () => {
+    flushContentSave(item.id, text.textContent);
+    wsSend({ type: 'blur' });
+  });
   text.addEventListener('paste', e => {
     e.preventDefault();
     document.execCommand('insertText', false, e.clipboardData.getData('text/plain'));
   });
+  wrapper.appendChild(text);
+
+  // peer pins container (one badge per peer on this item)
+  const pins = document.createElement('div');
+  pins.className = 'peer-pins';
 
   const del = document.createElement('button');
   del.className = 'delete-btn';
@@ -237,7 +270,8 @@ function makeItemEl(item) {
 
   div.appendChild(grip);
   div.appendChild(cb);
-  div.appendChild(text);
+  div.appendChild(wrapper);
+  div.appendChild(pins);
   div.appendChild(del);
   return div;
 }
@@ -424,7 +458,9 @@ async function createItem(parentId, afterId = null) {
       content: '', list_id: currentListId,
       parent_id: parentId ?? null, after_id: afterId ?? null,
     });
-    allItems.push(newItem);
+    if (!allItems.find(i => i.id === newItem.id)) {
+      allItems.push(newItem);
+    }
     pendingFocus = { id: newItem.id, atEnd: true };
     render();
   } catch (err) { showToast(err.message); }
@@ -521,8 +557,220 @@ function maybeRenorm(siblings, parentId) {
   return (sorted.length + 1) * 100;
 }
 
+// ── WebSocket ──────────────────────────────────────────────────────────────
+function connectWS(listId) {
+  disconnectWS();
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/${listId}`);
+  ws.onmessage = handleWSMessage;
+  ws.onclose = () => { ws = null; };
+  ws.onerror = () => {};
+}
+
+function disconnectWS() {
+  if (ws) {
+    try { ws.close(); } catch (_) {}
+    ws = null;
+  }
+  peers.clear();
+  myConnId = null;
+  myColor = null;
+}
+
+function wsSend(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+function handleWSMessage(event) {
+  let msg;
+  try { msg = JSON.parse(event.data); } catch { return; }
+
+  switch (msg.type) {
+    case 'init':
+      myConnId = msg.connectionId;
+      myColor = msg.color;
+      peers.clear();
+      msg.peers.forEach(p => peers.set(p.connectionId, { ...p, todoId: null, selection: null }));
+      renderPresenceBar();
+      renderPeerPresence();
+      break;
+
+    case 'join':
+      peers.set(msg.connectionId, { userId: msg.userId, username: msg.username, color: msg.color, todoId: null, selection: null });
+      renderPresenceBar();
+      break;
+
+    case 'leave':
+      peers.delete(msg.connectionId);
+      renderPresenceBar();
+      renderPeerPresence();
+      break;
+
+    case 'cursor': {
+      const p = peers.get(msg.connectionId);
+      if (p) {
+        peers.set(msg.connectionId, { ...p, todoId: msg.todoId, selection: msg.start !== msg.end ? { start: msg.start, end: msg.end } : null });
+        renderPeerPresence();
+      }
+      break;
+    }
+
+    case 'blur': {
+      const p = peers.get(msg.connectionId);
+      if (p) {
+        peers.set(msg.connectionId, { ...p, todoId: null, selection: null });
+        renderPeerPresence();
+      }
+      break;
+    }
+
+    case 'todo_create': {
+      if (!allItems.find(i => i.id === msg.todo.id)) {
+        allItems.push(msg.todo);
+        render();
+      }
+      break;
+    }
+
+    case 'todo_update': {
+      const idx = allItems.findIndex(i => i.id === msg.todo.id);
+      if (idx >= 0) {
+        const focusedEl = document.querySelector(`[data-id="${msg.todo.id}"] .item-text`);
+        const isFocused = document.activeElement === focusedEl;
+        allItems[idx] = isFocused
+          ? { ...allItems[idx], checked: msg.todo.checked, parent_id: msg.todo.parent_id, position: msg.todo.position }
+          : { ...allItems[idx], ...msg.todo };
+        render();
+      }
+      break;
+    }
+
+    case 'todo_delete': {
+      const ids = new Set(msg.todoIds);
+      if (allItems.some(i => ids.has(i.id))) {
+        allItems = allItems.filter(i => !ids.has(i.id));
+        render();
+      }
+      break;
+    }
+
+    case 'todo_bulk_move': {
+      msg.items.forEach(({ id, position }) => {
+        const item = getItem(id);
+        if (item) item.position = position;
+      });
+      render();
+      break;
+    }
+  }
+}
+
+// ── Cursor / selection tracking ────────────────────────────────────────────
+function getSelectionOffsets(el) {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return { start: 0, end: 0 };
+  const range = sel.getRangeAt(0);
+  if (!el.contains(range.commonAncestorContainer)) return { start: 0, end: 0 };
+  const preRange = range.cloneRange();
+  preRange.selectNodeContents(el);
+  preRange.setEnd(range.startContainer, range.startOffset);
+  const start = preRange.toString().length;
+  const end = start + range.toString().length;
+  return { start, end };
+}
+
+function scheduleSelectionSend(todoId, el) {
+  if (selectionSendTimer) clearTimeout(selectionSendTimer);
+  selectionSendTimer = setTimeout(() => {
+    selectionSendTimer = null;
+    const { start, end } = getSelectionOffsets(el);
+    wsSend({ type: 'cursor', todoId, start, end });
+  }, 40);
+}
+
+// ── Peer presence rendering ────────────────────────────────────────────────
+function renderPresenceBar() {
+  const bar = document.getElementById('presence-bar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  for (const [, peer] of peers) {
+    const av = document.createElement('span');
+    av.className = 'presence-avatar';
+    av.style.background = peer.color;
+    av.title = peer.username;
+    av.textContent = peer.username[0].toUpperCase();
+    bar.appendChild(av);
+  }
+}
+
+function renderPeerPresence() {
+  const todoList = document.getElementById('todo-list');
+  if (!todoList) return;
+
+  // Build map: todoId → [peer]
+  const byItem = new Map();
+  for (const [connId, peer] of peers) {
+    if (peer.todoId != null) {
+      if (!byItem.has(peer.todoId)) byItem.set(peer.todoId, []);
+      byItem.get(peer.todoId).push({ connId, ...peer });
+    }
+  }
+
+  todoList.querySelectorAll(':scope > .todo-item').forEach(el => {
+    const itemId = Number(el.dataset.id);
+    const itemPeers = byItem.get(itemId) || [];
+
+    // Update pins
+    const pins = el.querySelector('.peer-pins');
+    if (pins) {
+      pins.innerHTML = '';
+      itemPeers.forEach(p => {
+        const pin = document.createElement('span');
+        pin.className = 'peer-pin';
+        pin.style.background = p.color;
+        pin.title = p.username;
+        pin.textContent = p.username;
+        pins.appendChild(pin);
+      });
+    }
+
+    // Update selection mirrors
+    const wrapper = el.querySelector('.item-wrapper');
+    if (!wrapper) return;
+    const mirrors = wrapper.querySelector('.sel-mirrors');
+    if (!mirrors) return;
+    mirrors.innerHTML = '';
+
+    const textEl = el.querySelector('.item-text');
+    const text = textEl ? textEl.textContent : '';
+
+    itemPeers.forEach(p => {
+      if (!p.selection || p.selection.start === p.selection.end) return;
+      const { start, end } = p.selection;
+      const mirror = document.createElement('div');
+      mirror.className = 'sel-mirror';
+      mirror.style.setProperty('--peer-color', p.color);
+      const before = text.slice(0, start);
+      const sel = text.slice(start, end);
+      const after = text.slice(end);
+      if (before) mirror.appendChild(document.createTextNode(before));
+      if (sel) {
+        const span = document.createElement('span');
+        span.className = 'sel-range';
+        span.textContent = sel;
+        mirror.appendChild(span);
+      }
+      if (after) mirror.appendChild(document.createTextNode(after));
+      mirrors.appendChild(mirror);
+    });
+  });
+}
+
 // ── Views ──────────────────────────────────────────────────────────────────
 function showListsView() {
+  disconnectWS();
   currentListId = null;
   allItems = [];
   document.getElementById('lists-view').style.display = '';
@@ -625,6 +873,7 @@ async function switchList(listId) {
   showDetailView();
   initDragDrop();
   await loadTodos();
+  connectWS(listId);
 }
 
 function renderNoteHeaderActions(list) {
@@ -774,6 +1023,7 @@ function showApp() {
 }
 
 function showAuth() {
+  disconnectWS();
   document.getElementById('auth-section').style.display = '';
   document.getElementById('app-section').style.display = 'none';
   allItems = []; allLists = []; currentListId = null;
@@ -805,6 +1055,18 @@ function initNoteTitleSync() {
   });
   titleEl.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); titleEl.blur(); }
+  });
+}
+
+// ── Selection change tracking ──────────────────────────────────────────────
+function initSelectionTracking() {
+  document.addEventListener('selectionchange', () => {
+    const active = document.activeElement;
+    if (!active || !active.classList.contains('item-text')) return;
+    const itemEl = active.closest('.todo-item');
+    if (!itemEl) return;
+    const todoId = Number(itemEl.dataset.id);
+    scheduleSelectionSend(todoId, active);
   });
 }
 
@@ -888,5 +1150,6 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   initNoteTitleSync();
+  initSelectionTracking();
   checkAuth();
 });
