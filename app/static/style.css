@@ -269,12 +269,42 @@ body {
   color: var(--text-muted); font-weight: 400; pointer-events: none;
 }
 
+.note-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 13px;
+  flex-shrink: 0;
+}
+
 .note-header-actions {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding-bottom: 13px;
+}
+
+/* ── Presence bar ── */
+.presence-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.presence-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #fff;
+  cursor: default;
   flex-shrink: 0;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.18);
+  user-select: none;
 }
 
 .btn-share-note {
@@ -348,16 +378,80 @@ body {
 .cb.is-checked { background: var(--primary); border-color: var(--primary); }
 .cb svg { width: 11px; height: 11px; display: block; }
 
+/* ── Item wrapper (text + selection overlay) ── */
+.item-wrapper {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+}
+
 /* ── Item text ── */
 .item-text {
-  flex: 1; min-height: 36px; padding: 7px 6px 7px 8px;
+  display: block; width: 100%; min-height: 36px; padding: 7px 6px 7px 8px;
   font-size: 0.925rem; font-family: inherit; color: var(--text);
   outline: none; word-break: break-word; white-space: pre-wrap; line-height: 1.5;
+  position: relative; z-index: 1;
 }
 .item-text:empty::before {
   content: attr(data-placeholder); color: var(--text-muted); pointer-events: none;
 }
 .todo-item.is-checked .item-text { color: var(--text-checked); text-decoration: line-through; }
+
+/* ── Peer selection mirrors ── */
+.sel-mirrors {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  overflow: hidden;
+}
+
+.sel-mirror {
+  position: absolute;
+  inset: 0;
+  padding: 7px 6px 7px 8px;
+  font-size: 0.925rem;
+  font-family: inherit;
+  color: transparent;
+  white-space: pre-wrap;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.sel-mirror .sel-range {
+  background: var(--peer-color);
+  color: transparent;
+  border-radius: 2px;
+  opacity: 0.35;
+}
+
+/* ── Peer cursor pins ── */
+.peer-pins {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 8px 4px 0;
+}
+
+.peer-pin {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  color: #fff;
+  white-space: nowrap;
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.5;
+  cursor: default;
+  user-select: none;
+  opacity: 0.92;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
 
 /* ── Delete button ── */
 .delete-btn {

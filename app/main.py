@@ -1,10 +1,11 @@
 import os
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional, List
 
 import aiosqlite
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -16,6 +17,62 @@ ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+CURSOR_COLORS = [
+    "#E05C5C", "#3A9E8A", "#4A7FD4", "#C47B2A", "#9B59B6",
+    "#E67E22", "#1ABC9C", "#D4366E", "#2980B9", "#7D6608",
+]
+
+
+class ConnectionManager:
+    def __init__(self):
+        self._conns: dict[int, dict[str, WebSocket]] = {}
+        self._info: dict[str, dict] = {}
+        self._color_idx: dict[int, int] = {}
+
+    def connect(self, ws: WebSocket, list_id: int, user_id: int, username: str) -> str:
+        conn_id = uuid.uuid4().hex[:8]
+        idx = self._color_idx.get(list_id, 0)
+        color = CURSOR_COLORS[idx % len(CURSOR_COLORS)]
+        self._color_idx[list_id] = idx + 1
+        self._conns.setdefault(list_id, {})[conn_id] = ws
+        self._info[conn_id] = {"user_id": user_id, "username": username, "color": color, "list_id": list_id}
+        return conn_id
+
+    def disconnect(self, conn_id: str):
+        info = self._info.pop(conn_id, None)
+        if not info:
+            return
+        list_id = info["list_id"]
+        self._conns.get(list_id, {}).pop(conn_id, None)
+        if not self._conns.get(list_id):
+            self._conns.pop(list_id, None)
+            self._color_idx.pop(list_id, None)
+
+    async def broadcast(self, list_id: int, msg: dict, exclude: Optional[str] = None):
+        dead = []
+        for cid, ws in list(self._conns.get(list_id, {}).items()):
+            if cid == exclude:
+                continue
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                dead.append(cid)
+        for cid in dead:
+            self.disconnect(cid)
+
+    def get_peers(self, list_id: int, exclude: str) -> list:
+        return [
+            {"connectionId": cid, "userId": info["user_id"], "username": info["username"], "color": info["color"]}
+            for cid, info in self._info.items()
+            if info["list_id"] == list_id and cid != exclude
+        ]
+
+    def info(self, conn_id: str) -> dict:
+        return self._info.get(conn_id, {})
+
+
+manager = ConnectionManager()
 
 
 async def init_db():
@@ -487,7 +544,9 @@ async def create_todo(req: CreateTodoReq, user=Depends(get_current_user)):
         async with db.execute(
             "SELECT id, content, checked, parent_id, position FROM todos WHERE id = ?", (cur.lastrowid,)
         ) as c:
-            return dict(await c.fetchone())
+            todo = dict(await c.fetchone())
+    await manager.broadcast(req.list_id, {"type": "todo_create", "todo": todo})
+    return todo
 
 
 @app.put("/api/todos/{todo_id}")
@@ -498,7 +557,8 @@ async def update_todo(todo_id: int, req: UpdateTodoReq, user=Depends(get_current
             todo = await cur.fetchone()
         if not todo:
             raise HTTPException(404, "Todo not found")
-        await check_list_access(db, todo["list_id"], user["id"])
+        list_id = todo["list_id"]
+        await check_list_access(db, list_id, user["id"])
 
         sets = ["updated_at = CURRENT_TIMESTAMP"]
         vals = []
@@ -515,7 +575,9 @@ async def update_todo(todo_id: int, req: UpdateTodoReq, user=Depends(get_current
         async with db.execute(
             "SELECT id, content, checked, parent_id, position FROM todos WHERE id = ?", (todo_id,)
         ) as cur:
-            return dict(await cur.fetchone())
+            updated = dict(await cur.fetchone())
+    await manager.broadcast(list_id, {"type": "todo_update", "todo": updated})
+    return updated
 
 
 @app.put("/api/todos/{todo_id}/move")
@@ -526,7 +588,8 @@ async def move_todo(todo_id: int, req: MoveTodoReq, user=Depends(get_current_use
             todo = await cur.fetchone()
         if not todo:
             raise HTTPException(404, "Todo not found")
-        await check_list_access(db, todo["list_id"], user["id"])
+        list_id = todo["list_id"]
+        await check_list_access(db, list_id, user["id"])
 
         if req.parent_id is None:
             await db.execute(
@@ -542,7 +605,9 @@ async def move_todo(todo_id: int, req: MoveTodoReq, user=Depends(get_current_use
         async with db.execute(
             "SELECT id, content, checked, parent_id, position FROM todos WHERE id = ?", (todo_id,)
         ) as cur:
-            return dict(await cur.fetchone())
+            moved = dict(await cur.fetchone())
+    await manager.broadcast(list_id, {"type": "todo_update", "todo": moved})
+    return moved
 
 
 @app.delete("/api/todos/{todo_id}")
@@ -553,14 +618,27 @@ async def delete_todo(todo_id: int, user=Depends(get_current_user)):
             todo = await cur.fetchone()
         if not todo:
             raise HTTPException(404, "Todo not found")
-        await check_list_access(db, todo["list_id"], user["id"])
+        list_id = todo["list_id"]
+        await check_list_access(db, list_id, user["id"])
+
+        async def collect_deleted(tid: int, acc: set):
+            acc.add(tid)
+            async with db.execute("SELECT id FROM todos WHERE parent_id = ?", (tid,)) as c:
+                for row in await c.fetchall():
+                    await collect_deleted(row[0], acc)
+
+        deleted_ids: set = set()
+        await collect_deleted(todo_id, deleted_ids)
+
         await _delete_recursive(db, todo_id)
         await db.commit()
+    await manager.broadcast(list_id, {"type": "todo_delete", "todoIds": list(deleted_ids)})
     return {"ok": True}
 
 
 @app.post("/api/todos/bulk-positions")
 async def bulk_positions(items: List[BulkPositionItem], user=Depends(get_current_user)):
+    list_ids: set = set()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         checked_lists: set = set()
@@ -571,12 +649,76 @@ async def bulk_positions(items: List[BulkPositionItem], user=Depends(get_current
                 await check_list_access(db, todo["list_id"], user["id"])
                 checked_lists.add(todo["list_id"])
             if todo:
+                list_ids.add(todo["list_id"])
                 await db.execute(
                     "UPDATE todos SET position = ? WHERE id = ?",
                     (item.position, item.id)
                 )
         await db.commit()
+    for lid in list_ids:
+        await manager.broadcast(lid, {"type": "todo_bulk_move", "items": [i.dict() for i in items]})
     return {"ok": True}
+
+
+# --- WebSocket presence ---
+
+@app.websocket("/ws/{list_id}")
+async def ws_list(list_id: int, websocket: WebSocket, token: Optional[str] = Cookie(default=None)):
+    await websocket.accept()
+    if not token:
+        await websocket.close(1008)
+        return
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = int(payload["sub"])
+    except (JWTError, KeyError, ValueError):
+        await websocket.close(1008)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, username FROM users WHERE id = ?", (user_id,)) as cur:
+            user = await cur.fetchone()
+        if not user:
+            await websocket.close(1008)
+            return
+        try:
+            await check_list_access(db, list_id, user_id)
+        except HTTPException:
+            await websocket.close(1008)
+            return
+
+    username = user["username"]
+    conn_id = manager.connect(websocket, list_id, user_id, username)
+    info = manager.info(conn_id)
+
+    await websocket.send_json({
+        "type": "init",
+        "connectionId": conn_id,
+        "color": info["color"],
+        "peers": manager.get_peers(list_id, conn_id),
+    })
+    await manager.broadcast(list_id, {
+        "type": "join",
+        "connectionId": conn_id,
+        "userId": user_id,
+        "username": username,
+        "color": info["color"],
+    }, exclude=conn_id)
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            if msg_type in ("cursor", "selection", "blur"):
+                await manager.broadcast(list_id, {"connectionId": conn_id, **data}, exclude=conn_id)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        manager.disconnect(conn_id)
+        await manager.broadcast(list_id, {"type": "leave", "connectionId": conn_id})
 
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
