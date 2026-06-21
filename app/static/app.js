@@ -164,6 +164,7 @@ function makeItemEl(item) {
 
     const startX = e.clientX;
     const startY = e.clientY;
+    const startScrollY = window.scrollY;
     const THRESHOLD = e.pointerType === 'touch' ? 12 : 8;
     let dragging = false;
     let ghost = null;
@@ -174,6 +175,13 @@ function makeItemEl(item) {
     const onMove = ev => {
       if (!dragging) {
         if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < THRESHOLD) return;
+        // If the page has scrolled since pointerdown, the user is scrolling — abort drag
+        if (window.scrollY !== startScrollY) {
+          div.removeEventListener('pointermove', onMove);
+          div.removeEventListener('pointerup', onUp);
+          div.removeEventListener('pointercancel', onUp);
+          return;
+        }
         ev.preventDefault();
         dragging = true;
         dragItemId = item.id;
@@ -186,6 +194,9 @@ function makeItemEl(item) {
         ghost.textContent = getItem(item.id)?.content || '…';
         document.body.appendChild(ghost);
       }
+
+      // Prevent page scroll while an item is being dragged
+      ev.preventDefault();
 
       if (ghost) {
         ghost.style.left = (ev.clientX - offsetX) + 'px';
