@@ -62,6 +62,20 @@ async def init_db():
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS list_shares (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                list_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                shared_with_id INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (list_id) REFERENCES lists(id) ON DELETE CASCADE,
+                FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (shared_with_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE (list_id, shared_with_id)
+            )
+        """)
+
         # Migration: add list_id column if it doesn't exist yet
         async with db.execute("PRAGMA table_info(todos)") as cur:
             cols = {row["name"] for row in await cur.fetchall()}
@@ -117,6 +131,24 @@ async def get_current_user(token: Optional[str] = Cookie(default=None)):
     return {"id": user["id"], "username": user["username"]}
 
 
+async def check_list_access(db, list_id: int, user_id: int) -> dict:
+    """Returns list dict if user is owner or has share access."""
+    db.row_factory = aiosqlite.Row
+    async with db.execute("SELECT id, user_id FROM lists WHERE id = ?", (list_id,)) as cur:
+        lst = await cur.fetchone()
+    if not lst:
+        raise HTTPException(404, "List not found")
+    if lst["user_id"] == user_id:
+        return dict(lst)
+    async with db.execute(
+        "SELECT id FROM list_shares WHERE list_id = ? AND shared_with_id = ?",
+        (list_id, user_id)
+    ) as cur:
+        if not await cur.fetchone():
+            raise HTTPException(403, "Access denied")
+    return dict(lst)
+
+
 # --- Models ---
 
 class RegisterReq(BaseModel):
@@ -132,6 +164,9 @@ class CreateListReq(BaseModel):
 
 class UpdateListReq(BaseModel):
     title: Optional[str] = None
+
+class ShareListReq(BaseModel):
+    username: str
 
 class CreateTodoReq(BaseModel):
     content: str = ""
@@ -212,11 +247,46 @@ async def me(user=Depends(get_current_user)):
 async def get_lists(user=Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+
         async with db.execute(
             "SELECT id, title, position FROM lists WHERE user_id = ? ORDER BY position, id",
             (user["id"],)
         ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+            own_lists = [dict(r) for r in await cur.fetchall()]
+
+        result = []
+        for lst in own_lists:
+            async with db.execute(
+                """SELECT u.username FROM list_shares ls
+                   JOIN users u ON ls.shared_with_id = u.id
+                   WHERE ls.list_id = ?""",
+                (lst["id"],)
+            ) as cur:
+                shared_with = [row["username"] for row in await cur.fetchall()]
+            result.append({**lst, "is_owner": True, "shared_with": shared_with, "shared_by": None})
+
+        async with db.execute(
+            """SELECT l.id, l.title, l.position, u.username as owner_username
+               FROM list_shares ls
+               JOIN lists l ON ls.list_id = l.id
+               JOIN users u ON l.user_id = u.id
+               WHERE ls.shared_with_id = ?
+               ORDER BY l.position, l.id""",
+            (user["id"],)
+        ) as cur:
+            shared_lists = [dict(r) for r in await cur.fetchall()]
+
+        for lst in shared_lists:
+            result.append({
+                "id": lst["id"],
+                "title": lst["title"],
+                "position": lst["position"],
+                "is_owner": False,
+                "shared_with": [],
+                "shared_by": lst["owner_username"]
+            })
+
+        return result
 
 
 @app.post("/api/lists")
@@ -236,7 +306,8 @@ async def create_list(req: CreateListReq, user=Depends(get_current_user)):
         async with db.execute(
             "SELECT id, title, position FROM lists WHERE id = ?", (cur.lastrowid,)
         ) as c:
-            return dict(await c.fetchone())
+            row = dict(await c.fetchone())
+        return {**row, "is_owner": True, "shared_with": [], "shared_by": None}
 
 
 @app.put("/api/lists/{list_id}")
@@ -268,16 +339,68 @@ async def delete_list(list_id: int, user=Depends(get_current_user)):
         ) as cur:
             if not await cur.fetchone():
                 raise HTTPException(404, "List not found")
-        # Delete all root todos (cascades to children via recursive delete)
         async with db.execute(
             "SELECT id FROM todos WHERE list_id = ? AND parent_id IS NULL", (list_id,)
         ) as cur:
             root_ids = [row[0] for row in await cur.fetchall()]
         for tid in root_ids:
             await _delete_recursive(db, tid)
-        # Delete any orphaned todos in this list
         await db.execute("DELETE FROM todos WHERE list_id = ?", (list_id,))
         await db.execute("DELETE FROM lists WHERE id = ?", (list_id,))
+        await db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/lists/{list_id}/share")
+async def share_list(list_id: int, req: ShareListReq, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id FROM lists WHERE id = ? AND user_id = ?", (list_id, user["id"])
+        ) as cur:
+            if not await cur.fetchone():
+                raise HTTPException(404, "List not found")
+        async with db.execute(
+            "SELECT id, username FROM users WHERE username = ?", (req.username.strip(),)
+        ) as cur:
+            target = await cur.fetchone()
+        if not target:
+            raise HTTPException(404, f"User '{req.username}' not found")
+        if target["id"] == user["id"]:
+            raise HTTPException(400, "Cannot share with yourself")
+        try:
+            await db.execute(
+                "INSERT INTO list_shares (list_id, owner_id, shared_with_id) VALUES (?, ?, ?)",
+                (list_id, user["id"], target["id"])
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            pass
+        return {"ok": True, "username": target["username"]}
+
+
+@app.delete("/api/lists/{list_id}/share/{username}")
+async def unshare_list(list_id: int, username: str, user=Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, user_id FROM lists WHERE id = ?", (list_id,)) as cur:
+            lst = await cur.fetchone()
+        if not lst:
+            raise HTTPException(404, "List not found")
+
+        async with db.execute("SELECT id FROM users WHERE username = ?", (username,)) as cur:
+            target = await cur.fetchone()
+        if not target:
+            raise HTTPException(404, "User not found")
+
+        # Owner can remove anyone; shared user can remove themselves
+        if lst["user_id"] != user["id"] and target["id"] != user["id"]:
+            raise HTTPException(403, "Access denied")
+
+        await db.execute(
+            "DELETE FROM list_shares WHERE list_id = ? AND shared_with_id = ?",
+            (list_id, target["id"])
+        )
         await db.commit()
     return {"ok": True}
 
@@ -292,12 +415,12 @@ async def _delete_recursive(db, todo_id: int):
     await db.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
 
 
-async def _compute_position(db, user_id: int, list_id: int, parent_id: Optional[int], after_id: Optional[int]) -> float:
+async def _compute_position(db, list_id: int, parent_id: Optional[int], after_id: Optional[int]) -> float:
     db.row_factory = aiosqlite.Row
 
     if after_id is not None:
         async with db.execute(
-            "SELECT position FROM todos WHERE id = ? AND user_id = ?", (after_id, user_id)
+            "SELECT position FROM todos WHERE id = ? AND list_id = ?", (after_id, list_id)
         ) as cur:
             after_row = await cur.fetchone()
         if not after_row:
@@ -341,11 +464,7 @@ async def _compute_position(db, user_id: int, list_id: int, parent_id: Optional[
 async def list_todos(list_id: int, user=Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id FROM lists WHERE id = ? AND user_id = ?", (list_id, user["id"])
-        ) as cur:
-            if not await cur.fetchone():
-                raise HTTPException(404, "List not found")
+        await check_list_access(db, list_id, user["id"])
         async with db.execute(
             "SELECT id, content, checked, parent_id, position FROM todos WHERE list_id = ? ORDER BY position",
             (list_id,)
@@ -357,13 +476,9 @@ async def list_todos(list_id: int, user=Depends(get_current_user)):
 async def create_todo(req: CreateTodoReq, user=Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id FROM lists WHERE id = ? AND user_id = ?", (req.list_id, user["id"])
-        ) as cur:
-            if not await cur.fetchone():
-                raise HTTPException(404, "List not found")
+        await check_list_access(db, req.list_id, user["id"])
 
-        position = await _compute_position(db, user["id"], req.list_id, req.parent_id, req.after_id)
+        position = await _compute_position(db, req.list_id, req.parent_id, req.after_id)
         cur = await db.execute(
             "INSERT INTO todos (user_id, list_id, content, parent_id, position) VALUES (?, ?, ?, ?, ?)",
             (user["id"], req.list_id, req.content, req.parent_id, position)
@@ -379,11 +494,11 @@ async def create_todo(req: CreateTodoReq, user=Depends(get_current_user)):
 async def update_todo(todo_id: int, req: UpdateTodoReq, user=Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id FROM todos WHERE id = ? AND user_id = ?", (todo_id, user["id"])
-        ) as cur:
-            if not await cur.fetchone():
-                raise HTTPException(404, "Todo not found")
+        async with db.execute("SELECT id, list_id FROM todos WHERE id = ?", (todo_id,)) as cur:
+            todo = await cur.fetchone()
+        if not todo:
+            raise HTTPException(404, "Todo not found")
+        await check_list_access(db, todo["list_id"], user["id"])
 
         sets = ["updated_at = CURRENT_TIMESTAMP"]
         vals = []
@@ -407,11 +522,11 @@ async def update_todo(todo_id: int, req: UpdateTodoReq, user=Depends(get_current
 async def move_todo(todo_id: int, req: MoveTodoReq, user=Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id FROM todos WHERE id = ? AND user_id = ?", (todo_id, user["id"])
-        ) as cur:
-            if not await cur.fetchone():
-                raise HTTPException(404, "Todo not found")
+        async with db.execute("SELECT id, list_id FROM todos WHERE id = ?", (todo_id,)) as cur:
+            todo = await cur.fetchone()
+        if not todo:
+            raise HTTPException(404, "Todo not found")
+        await check_list_access(db, todo["list_id"], user["id"])
 
         if req.parent_id is None:
             await db.execute(
@@ -433,11 +548,12 @@ async def move_todo(todo_id: int, req: MoveTodoReq, user=Depends(get_current_use
 @app.delete("/api/todos/{todo_id}")
 async def delete_todo(todo_id: int, user=Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id FROM todos WHERE id = ? AND user_id = ?", (todo_id, user["id"])
-        ) as cur:
-            if not await cur.fetchone():
-                raise HTTPException(404, "Todo not found")
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, list_id FROM todos WHERE id = ?", (todo_id,)) as cur:
+            todo = await cur.fetchone()
+        if not todo:
+            raise HTTPException(404, "Todo not found")
+        await check_list_access(db, todo["list_id"], user["id"])
         await _delete_recursive(db, todo_id)
         await db.commit()
     return {"ok": True}
@@ -446,11 +562,19 @@ async def delete_todo(todo_id: int, user=Depends(get_current_user)):
 @app.post("/api/todos/bulk-positions")
 async def bulk_positions(items: List[BulkPositionItem], user=Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        checked_lists: set = set()
         for item in items:
-            await db.execute(
-                "UPDATE todos SET position = ? WHERE id = ? AND user_id = ?",
-                (item.position, item.id, user["id"])
-            )
+            async with db.execute("SELECT list_id FROM todos WHERE id = ?", (item.id,)) as cur:
+                todo = await cur.fetchone()
+            if todo and todo["list_id"] not in checked_lists:
+                await check_list_access(db, todo["list_id"], user["id"])
+                checked_lists.add(todo["list_id"])
+            if todo:
+                await db.execute(
+                    "UPDATE todos SET position = ? WHERE id = ?",
+                    (item.position, item.id)
+                )
         await db.commit()
     return {"ok": True}
 

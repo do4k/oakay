@@ -77,6 +77,7 @@ function getDescendantIds(id) {
 const checkSvg = () => `<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
 const trashSvg = () => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
 const gripSvg = () => `<svg viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="2.5" r="1.4"/><circle cx="7" cy="2.5" r="1.4"/><circle cx="3" cy="8" r="1.4"/><circle cx="7" cy="8" r="1.4"/><circle cx="3" cy="13.5" r="1.4"/><circle cx="7" cy="13.5" r="1.4"/></svg>`;
+const shareSvg = () => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>`;
 
 // ── Render (todos) ─────────────────────────────────────────────────────────
 function render() {
@@ -91,7 +92,6 @@ function render() {
   const flat = getFlatItems();
   const newIds = new Set(flat.map(i => i.id));
 
-  // Remove stale .todo-item nodes only (preserve #drop-line, .empty-hint)
   [...list.querySelectorAll(':scope > .todo-item')].forEach(el => {
     if (!newIds.has(Number(el.dataset.id))) el.remove();
   });
@@ -104,24 +104,20 @@ function render() {
       list.appendChild(el);
     }
 
-    // Update in-place
     el.setAttribute('data-depth', item.depth);
     el.classList.toggle('is-checked', !!item.checked);
     const cb = el.querySelector('.cb');
     cb.classList.toggle('is-checked', !!item.checked);
     cb.innerHTML = item.checked ? checkSvg() : '';
     const textEl = el.querySelector('.item-text');
-    // Only overwrite text if element is not focused (preserve user's in-progress typing)
     if (document.activeElement !== textEl) textEl.textContent = item.content;
 
-    // Ensure correct DOM order
     const itemEls = [...list.querySelectorAll(':scope > .todo-item')];
     if (itemEls[idx] !== el) {
       list.insertBefore(el, itemEls[idx] || document.getElementById('drop-line') || null);
     }
   });
 
-  // Empty state
   let emptyEl = list.querySelector('.empty-hint');
   if (flat.length === 0) {
     if (!emptyEl) {
@@ -147,17 +143,13 @@ function makeItemEl(item) {
   div.dataset.id = item.id;
   div.setAttribute('data-depth', item.depth);
 
-  // Grip (visual affordance only — drag is handled by pointerdown below)
   const grip = document.createElement('div');
   grip.className = 'grip';
   grip.innerHTML = gripSvg();
   grip.title = 'Drag to reorder or indent';
 
-  // ── Pointer-based drag (works on touch + desktop, drags from anywhere on item) ──
   div.addEventListener('pointerdown', e => {
-    // Only primary button / touch
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    // Skip interactive children
     if (e.target.closest('.cb') || e.target.closest('.delete-btn')) return;
 
     const startX = e.clientX;
@@ -172,7 +164,6 @@ function makeItemEl(item) {
     const onMove = ev => {
       if (!dragging) {
         if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < THRESHOLD) return;
-        // Threshold crossed → start drag
         ev.preventDefault();
         dragging = true;
         dragItemId = item.id;
@@ -219,13 +210,11 @@ function makeItemEl(item) {
     div.addEventListener('pointercancel', onUp);
   });
 
-  // Checkbox
   const cb = document.createElement('div');
   cb.className = `cb${item.checked ? ' is-checked' : ''}`;
   cb.innerHTML = item.checked ? checkSvg() : '';
   cb.addEventListener('click', () => toggleCheck(item.id));
 
-  // Text
   const text = document.createElement('div');
   text.className = 'item-text';
   text.contentEditable = 'true';
@@ -240,7 +229,6 @@ function makeItemEl(item) {
     document.execCommand('insertText', false, e.clipboardData.getData('text/plain'));
   });
 
-  // Delete
   const del = document.createElement('button');
   del.className = 'delete-btn';
   del.innerHTML = trashSvg();
@@ -447,10 +435,8 @@ async function toggleCheck(id) {
   if (!item) return;
   const newChecked = !item.checked;
 
-  // Cascade DOWN to descendants
   const affected = [id, ...getDescendantIds(id)];
 
-  // When unchecking, cascade UP: uncheck all checked ancestors
   if (!newChecked) {
     let curId = item.parent_id;
     while (curId != null) {
@@ -535,93 +521,150 @@ function maybeRenorm(siblings, parentId) {
   return (sorted.length + 1) * 100;
 }
 
-// ── Lists ──────────────────────────────────────────────────────────────────
-function renderSidebar() {
-  const nav = document.getElementById('list-nav');
-  if (!nav) return;
-  nav.innerHTML = '';
+// ── Views ──────────────────────────────────────────────────────────────────
+function showListsView() {
+  currentListId = null;
+  allItems = [];
+  document.getElementById('lists-view').style.display = '';
+  document.getElementById('detail-view').style.display = 'none';
+  document.getElementById('back-btn').style.display = 'none';
+  renderListTiles();
+}
+
+function showDetailView() {
+  document.getElementById('lists-view').style.display = 'none';
+  document.getElementById('detail-view').style.display = '';
+  document.getElementById('back-btn').style.display = '';
+}
+
+// ── List tiles ─────────────────────────────────────────────────────────────
+function renderListTiles() {
+  const grid = document.getElementById('lists-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+
+  if (allLists.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'tiles-empty';
+    empty.innerHTML = '<strong>No lists yet</strong>Click "New list" to get started.';
+    grid.appendChild(empty);
+    return;
+  }
 
   allLists.forEach(list => {
-    const item = document.createElement('div');
-    item.className = `list-item${list.id === currentListId ? ' active' : ''}`;
-    item.dataset.id = list.id;
+    const tile = document.createElement('div');
+    tile.className = 'list-tile';
+    tile.dataset.id = list.id;
 
-    const dot = document.createElement('div');
-    dot.className = 'list-dot';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'tile-title';
+    titleEl.textContent = list.title;
 
-    const name = document.createElement('span');
-    name.className = 'list-name';
-    name.textContent = list.title;
+    const pills = document.createElement('div');
+    pills.className = 'tile-pills';
 
-    const del = document.createElement('button');
-    del.className = 'list-del';
-    del.textContent = '×';
-    del.title = 'Delete list';
-    del.addEventListener('click', e => { e.stopPropagation(); deleteList(list.id); });
+    if (list.shared_by) {
+      const pill = document.createElement('span');
+      pill.className = 'pill pill-shared-by';
+      pill.textContent = `Shared by ${list.shared_by}`;
+      pills.appendChild(pill);
+    } else if (list.shared_with && list.shared_with.length > 0) {
+      const pill = document.createElement('span');
+      pill.className = 'pill pill-shared-with';
+      const n = list.shared_with.length;
+      pill.textContent = `Shared with ${n} ${n === 1 ? 'person' : 'people'}`;
+      pills.appendChild(pill);
+    }
 
-    item.appendChild(dot);
-    item.appendChild(name);
-    item.appendChild(del);
-    item.addEventListener('click', () => switchList(list.id));
-    name.addEventListener('dblclick', e => { e.stopPropagation(); startRenameList(list.id, name); });
-    nav.appendChild(item);
+    const actions = document.createElement('div');
+    actions.className = 'tile-actions';
+
+    if (list.is_owner) {
+      const shareBtn = document.createElement('button');
+      shareBtn.className = 'tile-action-btn';
+      shareBtn.title = 'Share';
+      shareBtn.innerHTML = shareSvg();
+      shareBtn.addEventListener('click', e => { e.stopPropagation(); openShareModal(list.id); });
+      actions.appendChild(shareBtn);
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'tile-action-btn tile-action-del';
+      delBtn.title = 'Delete list';
+      delBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" width="13" height="13"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+      delBtn.addEventListener('click', e => { e.stopPropagation(); deleteList(list.id); });
+      actions.appendChild(delBtn);
+    } else {
+      const leaveBtn = document.createElement('button');
+      leaveBtn.className = 'tile-action-btn tile-action-del';
+      leaveBtn.title = 'Leave list';
+      leaveBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" width="13" height="13"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+      leaveBtn.addEventListener('click', e => { e.stopPropagation(); leaveList(list.id); });
+      actions.appendChild(leaveBtn);
+    }
+
+    tile.appendChild(actions);
+    tile.appendChild(titleEl);
+    tile.appendChild(pills);
+    tile.addEventListener('click', () => switchList(list.id));
+    grid.appendChild(tile);
   });
 }
 
+// ── Lists management ───────────────────────────────────────────────────────
 async function loadLists() {
   allLists = await api('GET', '/api/lists');
-  renderSidebar();
-  if (allLists.length > 0) {
-    const validId = allLists.find(l => l.id === currentListId) ? currentListId : allLists[0].id;
-    await switchList(validId);
-  } else {
-    setNoteTitle('');
-    render();
-    showNoListsHint();
-  }
-}
-
-function showNoListsHint() {
-  const main = document.querySelector('.app-main');
-  if (!main) return;
-  let hint = main.querySelector('.no-lists-hint');
-  if (!hint) {
-    hint = document.createElement('div');
-    hint.className = 'no-lists-hint';
-    hint.innerHTML = '<strong>No lists yet</strong>Click "New list" in the sidebar to get started.';
-    const card = document.getElementById('note-card');
-    if (card) card.style.display = 'none';
-    main.appendChild(hint);
-  }
-}
-
-function hideNoListsHint() {
-  const main = document.querySelector('.app-main');
-  const hint = main?.querySelector('.no-lists-hint');
-  hint?.remove();
-  const card = document.getElementById('note-card');
-  if (card) card.style.display = '';
+  renderListTiles();
 }
 
 async function switchList(listId) {
   currentListId = listId;
   allItems = [];
-  renderSidebar();
-  hideNoListsHint();
   const list = allLists.find(l => l.id === listId);
   setNoteTitle(list?.title ?? '');
+  renderNoteHeaderActions(list);
+  showDetailView();
+  initDragDrop();
   await loadTodos();
+}
+
+function renderNoteHeaderActions(list) {
+  const actions = document.getElementById('note-header-actions');
+  if (!actions) return;
+  actions.innerHTML = '';
+
+  if (!list) return;
+
+  if (list.is_owner) {
+    const shareBtn = document.createElement('button');
+    shareBtn.className = 'btn-ghost btn-share-note';
+    shareBtn.innerHTML = `${shareSvg()} Share`;
+    shareBtn.addEventListener('click', () => openShareModal(list.id));
+    actions.appendChild(shareBtn);
+  } else if (list.shared_by) {
+    const badge = document.createElement('span');
+    badge.className = 'pill pill-shared-by';
+    badge.textContent = `Shared by ${list.shared_by}`;
+    actions.appendChild(badge);
+  }
 }
 
 async function createList() {
   try {
     const list = await api('POST', '/api/lists', { title: 'New List' });
     allLists.push(list);
-    renderSidebar();
     await switchList(list.id);
-    // Immediately rename the sidebar entry
-    const nameEl = document.querySelector(`.list-item[data-id="${list.id}"] .list-name`);
-    if (nameEl) startRenameList(list.id, nameEl);
+    // Put focus on the title so user can rename immediately
+    requestAnimationFrame(() => {
+      const titleEl = document.getElementById('note-title');
+      if (titleEl) {
+        titleEl.focus();
+        const range = document.createRange();
+        range.selectNodeContents(titleEl);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    });
   } catch (err) { showToast(err.message); }
 }
 
@@ -630,54 +673,86 @@ async function deleteList(listId) {
   try {
     await api('DELETE', `/api/lists/${listId}`);
     allLists = allLists.filter(l => l.id !== listId);
-    if (currentListId === listId) {
-      currentListId = null;
-      allItems = [];
-    }
-    renderSidebar();
-    if (allLists.length > 0) {
-      await switchList(allLists[0].id);
-    } else {
-      render();
-      showNoListsHint();
-    }
+    showListsView();
   } catch (err) { showToast(err.message); }
 }
 
-function startRenameList(listId, nameEl) {
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.value = nameEl.textContent;
-  input.className = 'list-rename-input';
-  nameEl.replaceWith(input);
-  input.focus();
-  input.select();
-
-  let done = false;
-  const finish = async () => {
-    if (done) return;
-    done = true;
-    const newTitle = input.value.trim() || 'Untitled';
-    input.replaceWith(nameEl);
-    nameEl.textContent = newTitle;
-    const list = allLists.find(l => l.id === listId);
-    if (list && list.title !== newTitle) {
-      list.title = newTitle;
-      if (listId === currentListId) setNoteTitle(newTitle);
-      await api('PUT', `/api/lists/${listId}`, { title: newTitle }).catch(err => showToast(err.message));
-    }
-  };
-
-  input.addEventListener('blur', finish);
-  input.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
-    if (e.key === 'Escape') { input.value = nameEl.textContent; done = true; input.replaceWith(nameEl); }
-  });
+async function leaveList(listId) {
+  if (!confirm('Leave this shared list?')) return;
+  try {
+    await api('DELETE', `/api/lists/${listId}/share/${currentUser.username}`);
+    allLists = allLists.filter(l => l.id !== listId);
+    if (currentListId === listId) showListsView();
+    else renderListTiles();
+  } catch (err) { showToast(err.message); }
 }
 
 function setNoteTitle(title) {
   const el = document.getElementById('note-title');
   if (el) el.textContent = title;
+}
+
+// ── Share modal ────────────────────────────────────────────────────────────
+let shareModalListId = null;
+
+function openShareModal(listId) {
+  shareModalListId = listId;
+  const list = allLists.find(l => l.id === listId);
+  const titleEl = document.getElementById('share-modal-title');
+  if (titleEl) titleEl.textContent = `Share "${list?.title ?? 'list'}"`;
+  document.getElementById('share-username-input').value = '';
+  renderShareMembers(list?.shared_with ?? []);
+  document.getElementById('share-modal').style.display = '';
+  document.getElementById('share-username-input').focus();
+}
+
+function closeShareModal() {
+  document.getElementById('share-modal').style.display = 'none';
+  shareModalListId = null;
+}
+
+function renderShareMembers(sharedWith) {
+  const container = document.getElementById('share-members');
+  if (!container) return;
+  container.innerHTML = '';
+
+  if (!sharedWith || sharedWith.length === 0) {
+    container.innerHTML = '<p class="share-empty">Not shared with anyone yet.</p>';
+    return;
+  }
+
+  const label = document.createElement('p');
+  label.className = 'share-members-label';
+  label.textContent = 'Shared with:';
+  container.appendChild(label);
+
+  sharedWith.forEach(username => {
+    const row = document.createElement('div');
+    row.className = 'share-member-row';
+
+    const name = document.createElement('span');
+    name.className = 'share-member-name';
+    name.textContent = username;
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'btn-ghost btn-remove-share';
+    removeBtn.textContent = 'Remove';
+    removeBtn.addEventListener('click', async () => {
+      try {
+        await api('DELETE', `/api/lists/${shareModalListId}/share/${username}`);
+        const list = allLists.find(l => l.id === shareModalListId);
+        if (list) {
+          list.shared_with = list.shared_with.filter(u => u !== username);
+          renderShareMembers(list.shared_with);
+          renderListTiles();
+        }
+      } catch (err) { showToast(err.message); }
+    });
+
+    row.appendChild(name);
+    row.appendChild(removeBtn);
+    container.appendChild(row);
+  });
 }
 
 // ── Auth & load ────────────────────────────────────────────────────────────
@@ -696,7 +771,6 @@ function showApp() {
   document.getElementById('auth-section').style.display = 'none';
   document.getElementById('app-section').style.display = '';
   document.getElementById('username-display').textContent = currentUser.username;
-  initDragDrop();
 }
 
 function showAuth() {
@@ -715,44 +789,6 @@ function showToast(msg) {
   toastTimer = setTimeout(() => el.classList.remove('visible'), 3500);
 }
 
-// ── Sidebar toggle ─────────────────────────────────────────────────────────
-function initSidebarToggle() {
-  const btn = document.getElementById('sidebar-toggle');
-  const sidebar = document.getElementById('sidebar');
-  const backdrop = document.getElementById('sidebar-backdrop');
-  if (!btn || !sidebar) return;
-
-  const isMobile = () => window.innerWidth <= 600;
-
-  function openSidebar() {
-    sidebar.classList.remove('hidden');
-    if (isMobile() && backdrop) backdrop.classList.add('visible');
-  }
-
-  function closeSidebar() {
-    sidebar.classList.add('hidden');
-    if (backdrop) backdrop.classList.remove('visible');
-  }
-
-  // Start hidden on mobile
-  if (isMobile()) sidebar.classList.add('hidden');
-
-  btn.addEventListener('click', () => {
-    if (sidebar.classList.contains('hidden')) openSidebar();
-    else closeSidebar();
-  });
-
-  if (backdrop) backdrop.addEventListener('click', closeSidebar);
-
-  // Close on resize to desktop (avoids stuck-hidden state)
-  window.addEventListener('resize', () => {
-    if (!isMobile()) {
-      sidebar.classList.remove('hidden');
-      backdrop?.classList.remove('visible');
-    }
-  });
-}
-
 // ── Note title sync (renames current list) ─────────────────────────────────
 function initNoteTitleSync() {
   const titleEl = document.getElementById('note-title');
@@ -763,7 +799,7 @@ function initNoteTitleSync() {
     const list = allLists.find(l => l.id === currentListId);
     if (list && list.title !== newTitle) {
       list.title = newTitle;
-      renderSidebar();
+      renderListTiles();
       api('PUT', `/api/lists/${currentListId}`, { title: newTitle }).catch(err => showToast(err.message));
     }
   });
@@ -801,6 +837,11 @@ document.addEventListener('DOMContentLoaded', () => {
     currentUser = null; showAuth();
   });
 
+  document.getElementById('back-btn').addEventListener('click', () => {
+    showListsView();
+    loadLists();
+  });
+
   document.getElementById('new-list-btn').addEventListener('click', createList);
 
   document.getElementById('add-item-btn').addEventListener('click', () => {
@@ -822,7 +863,30 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('login-username').focus();
   });
 
-  initSidebarToggle();
+  // Share modal
+  document.getElementById('share-modal-close').addEventListener('click', closeShareModal);
+  document.getElementById('share-modal').addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeShareModal();
+  });
+
+  document.getElementById('share-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const input = document.getElementById('share-username-input');
+    const username = input.value.trim();
+    if (!username || !shareModalListId) return;
+    try {
+      await api('POST', `/api/lists/${shareModalListId}/share`, { username });
+      const list = allLists.find(l => l.id === shareModalListId);
+      if (list && !list.shared_with.includes(username)) {
+        list.shared_with.push(username);
+        renderShareMembers(list.shared_with);
+        renderListTiles();
+      }
+      input.value = '';
+      showToast(`Shared with ${username}`);
+    } catch (err) { showToast(err.message); }
+  });
+
   initNoteTitleSync();
   checkAuth();
 });
